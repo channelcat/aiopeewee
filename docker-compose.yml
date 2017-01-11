@@ -1,0 +1,20 @@
+version: '2'
+services:
+  test:
+    build: .
+    volumes:
+      - .:/code
+    ports:
+      - 8001:80
+    #command: python -m pytest tests
+    command: python tests/test_async.py
+    depends_on:
+      - database
+  database:
+    image: postgres
+    environment:
+      - POSTGRES_PASSWORD=testpw
+      - POSTGRES_USER=admin
+      - POSTGRES_DB=testing
+    ports:
+      - 5433:5432

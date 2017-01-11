@@ -75,7 +75,6 @@ __all__ = [
     'JOIN_INNER',
     'JOIN_LEFT_OUTER',
     'Model',
-    'MySQLDatabase',
     'NotSupportedError',
     'OperationalError',
     'Param',
@@ -86,7 +85,6 @@ __all__ = [
     'Proxy',
     'R',
     'SmallIntegerField',
-    'SqliteDatabase',
     'SQL',
     'TextField',
     'TimeField',
@@ -165,15 +163,9 @@ else:
         sqlite3 = pysq3
 
 try:
-    from psycopg2cffi import compat
-    compat.register()
+    import asyncpg
 except ImportError:
-    pass
-try:
-    import psycopg2
-    from psycopg2 import extensions as pg_extensions
-except ImportError:
-    psycopg2 = None
+    asyncpg = None
 try:
     import MySQLdb as mysql  # prefer the C module.
 except ImportError:
@@ -449,6 +441,7 @@ class DeferredRelation(object):
             field.rel_model = rel_model
             field.add_to_class(model, name)
 
+    # noinspection PyUnboundLocalVariable
     @staticmethod
     def resolve(model_cls):
         unresolved = list(DeferredRelation._unresolved)
@@ -1629,11 +1622,17 @@ class QueryCompiler(object):
     def __init__(self, quote_char='"', interpolation='?', field_overrides=None,
                  op_overrides=None):
         self.quote_char = quote_char
-        self.interpolation = interpolation
+        self._interpolation = interpolation
         self._field_map = merge_dict(self.field_map, field_overrides or {})
         self._op_map = merge_dict(self.op_map, op_overrides or {})
         self._parse_map = self.get_parse_map()
         self._unknown_types = set(['param'])
+        self._interpolation_index = 0
+
+    @property
+    def interpolation(self):
+        self._interpolation_index += 1
+        return self._interpolation.format(index=self._interpolation_index)
 
     def get_parse_map(self):
         # To avoid O(n) lookups when parsing nodes, use a lookup table for
@@ -2239,6 +2238,8 @@ class QueryResultWrapper(object):
     def __init__(self, model, cursor, meta=None):
         self.model = model
         self.cursor = cursor
+        print("WHAT I GOT IS")
+        print(cursor)
 
         self._ct = 0
         self._idx = 0
@@ -2855,9 +2856,9 @@ class Query(Node):
     def sql(self):
         raise NotImplementedError
 
-    def _execute(self):
+    async def _execute(self):
         sql, params = self.sql()
-        return self.database.execute_sql(sql, params, self.require_commit)
+        return await self.database.execute_sql(sql, params, self.require_commit)
 
     def execute(self):
         raise NotImplementedError
@@ -3118,17 +3119,17 @@ class SelectQuery(Query):
         clone._select = [SQL('1')]
         return bool(clone.scalar())
 
-    def get(self):
+    async def get(self):
         clone = self.paginate(1, 1)
         try:
-            return next(clone.execute())
+            return next(await clone.execute())
         except StopIteration:
             raise self.model_class.DoesNotExist(
                 'Instance matching query does not exist:\nSQL: %s\nPARAMS: %s'
                 % self.sql())
 
-    def peek(self, n=1):
-        res = self.execute()
+    async def peek(self, n=1):
+        res = await self.execute()
         res.fill_cache(n)
         models = res._result_cache[:n]
         if models:
@@ -3168,22 +3169,23 @@ class SelectQuery(Query):
         else:
             return self.database.get_result_wrapper(RESULTS_MODELS)
 
-    def execute(self):
+    async def execute(self):
         if self._dirty or self._qr is None:
             model_class = self.model_class
             query_meta = self.get_query_meta()
             ResultWrapper = self._get_result_wrapper()
-            self._qr = ResultWrapper(model_class, self._execute(), query_meta)
+            self._qr = ResultWrapper(model_class, await self._execute(), query_meta)
             self._dirty = False
             return self._qr
         else:
             return self._qr
 
-    def __iter__(self):
-        return iter(self.execute())
+    async def __aiter__(self):
+        return iter(await self.execute())
 
-    def iterator(self):
-        return iter(self.execute().iterator())
+    # def iterator(self):
+    #     execution = await self.execute()
+    #     return iter(execution.iterator())
 
     def __getitem__(self, value):
         res = self.execute()
@@ -3436,12 +3438,12 @@ class InsertQuery(_WriteQuery):
     def sql(self):
         return self.compiler().generate_insert(self)
 
-    def _insert_with_loop(self):
+    async def _insert_with_loop(self):
         id_list = []
         last_id = None
         return_id_list = self._return_id_list
         for row in self._rows:
-            last_id = (InsertQuery(self.model_class, row)
+            last_id = (await InsertQuery(self.model_class, row)
                        .upsert(self._upsert)
                        .execute())
             if return_id_list:
@@ -3452,24 +3454,26 @@ class InsertQuery(_WriteQuery):
         else:
             return last_id
 
-    def execute(self):
+    async def execute(self):
         insert_with_loop = (
             self._is_multi_row_insert and
             self._query is None and
             self._returning is None and
             not self.database.insert_many)
         if insert_with_loop:
-            return self._insert_with_loop()
+            return await self._insert_with_loop()
 
         if self._returning is not None and self._qr is None:
             return self._execute_with_result_wrapper()
         elif self._qr is not None:
             return self._qr
         else:
-            cursor = self._execute()
+            cursor = await self._execute()
+            print("I got")
+            print(results)
             if not self._is_multi_row_insert:
                 if self.database.insert_returning:
-                    pk_row = cursor.fetchone()
+                    pk_row = results[0]
                     meta = self.model_class._meta
                     clean_data = [
                         field.python_value(column)
@@ -3478,9 +3482,9 @@ class InsertQuery(_WriteQuery):
                     if self.model_class._meta.composite_key:
                         return clean_data
                     return clean_data[0]
-                return self.database.last_insert_id(cursor, self.model_class)
+                return self.database.last_insert_id(results, self.model_class)
             elif self._return_id_list:
-                return map(operator.itemgetter(0), cursor.fetchall())
+                return map(operator.itemgetter(0), results)
             else:
                 return True
 
@@ -3614,41 +3618,41 @@ class Database(object):
         self.database = database
         self.connect_kwargs.update(connect_kwargs)
 
-    def connect(self):
+    async def connect(self):
         with self._conn_lock:
             if self.deferred:
                 raise OperationalError('Database has not been initialized')
             if not self._local.closed:
                 raise OperationalError('Connection already open')
-            self._local.conn = self._create_connection()
+            self._local.conn = await self._create_connection()
             self._local.closed = False
             with self.exception_wrapper:
-                self.initialize_connection(self._local.conn)
+                await self.initialize_connection(self._local.conn)
 
-    def initialize_connection(self, conn):
+    async def initialize_connection(self, conn):
         pass
 
-    def close(self):
+    async def close(self):
         with self._conn_lock:
             if self.deferred:
                 raise Exception('Error, database not properly initialized '
                                 'before closing connection')
             with self.exception_wrapper:
-                self._close(self._local.conn)
+                await self._close(self._local.conn)
                 self._local.closed = True
 
-    def get_conn(self):
+    async def get_conn(self):
         if self._local.context_stack:
             conn = self._local.context_stack[-1].connection
             if conn is not None:
                 return conn
         if self._local.closed:
-            self.connect()
+            await self.connect()
         return self._local.conn
 
-    def _create_connection(self):
+    async def _create_connection(self):
         with self.exception_wrapper:
-            return self._connect(self.database, **self.connect_kwargs)
+            return await self._connect(self.database, **self.connect_kwargs)
 
     def is_closed(self):
         return self._local.closed
@@ -3656,10 +3660,10 @@ class Database(object):
     def get_cursor(self):
         return self.get_conn().cursor()
 
-    def _close(self, conn):
-        conn.close()
+    async def _close(self, conn):
+        await conn.close()
 
-    def _connect(self, database, **kwargs):
+    async def _connect(self, database, **kwargs):
         raise NotImplementedError
 
     @classmethod
@@ -3772,32 +3776,32 @@ class Database(object):
     def atomic(self, transaction_type=None):
         return _atomic(self, transaction_type)
 
-    def get_tables(self, schema=None):
+    async def get_tables(self, schema=None):
         raise NotImplementedError
 
-    def get_indexes(self, table, schema=None):
+    async def get_indexes(self, table, schema=None):
         raise NotImplementedError
 
-    def get_columns(self, table, schema=None):
+    async def get_columns(self, table, schema=None):
         raise NotImplementedError
 
-    def get_primary_keys(self, table, schema=None):
+    async def get_primary_keys(self, table, schema=None):
         raise NotImplementedError
 
-    def get_foreign_keys(self, table, schema=None):
+    async def get_foreign_keys(self, table, schema=None):
         raise NotImplementedError
 
-    def sequence_exists(self, seq):
+    async def sequence_exists(self, seq):
         raise NotImplementedError
 
-    def create_table(self, model_class, safe=False):
+    async def create_table(self, model_class, safe=False):
         qc = self.compiler()
-        return self.execute_sql(*qc.create_table(model_class, safe))
+        return await self.execute_sql(*qc.create_table(model_class, safe))
 
-    def create_tables(self, models, safe=False):
-        create_model_tables(models, fail_silently=safe)
+    async def create_tables(self, models, safe=False):
+        return await create_model_tables(models, fail_silently=safe)
 
-    def create_index(self, model_class, fields, unique=False):
+    async def create_index(self, model_class, fields, unique=False):
         qc = self.compiler()
         if not isinstance(fields, (list, tuple)):
             raise ValueError('Fields passed to "create_index" must be a list '
@@ -3805,9 +3809,9 @@ class Database(object):
         fobjs = [
             model_class._meta.fields[f] if isinstance(f, basestring) else f
             for f in fields]
-        return self.execute_sql(*qc.create_index(model_class, fobjs, unique))
+        return await self.execute_sql(*qc.create_index(model_class, fobjs, unique))
 
-    def drop_index(self, model_class, fields, safe=False):
+    async def drop_index(self, model_class, fields, safe=False):
         qc = self.compiler()
         if not isinstance(fields, (list, tuple)):
             raise ValueError('Fields passed to "drop_index" must be a list '
@@ -3815,40 +3819,40 @@ class Database(object):
         fobjs = [
             model_class._meta.fields[f] if isinstance(f, basestring) else f
             for f in fields]
-        return self.execute_sql(*qc.drop_index(model_class, fobjs, safe))
+        return await self.execute_sql(*qc.drop_index(model_class, fobjs, safe))
 
-    def create_foreign_key(self, model_class, field, constraint=None):
+    async def create_foreign_key(self, model_class, field, constraint=None):
         qc = self.compiler()
-        return self.execute_sql(*qc.create_foreign_key(
+        return await self.execute_sql(*qc.create_foreign_key(
             model_class, field, constraint))
 
-    def create_sequence(self, seq):
+    async def create_sequence(self, seq):
         if self.sequences:
             qc = self.compiler()
-            return self.execute_sql(*qc.create_sequence(seq))
+            return await self.execute_sql(*qc.create_sequence(seq))
 
-    def drop_table(self, model_class, fail_silently=False, cascade=False):
+    async def drop_table(self, model_class, fail_silently=False, cascade=False):
         qc = self.compiler()
-        return self.execute_sql(*qc.drop_table(
+        return await self.execute_sql(*qc.drop_table(
             model_class, fail_silently, cascade))
 
-    def drop_tables(self, models, safe=False, cascade=False):
-        drop_model_tables(models, fail_silently=safe, cascade=cascade)
+    async def drop_tables(self, models, safe=False, cascade=False):
+        await drop_model_tables(models, fail_silently=safe, cascade=cascade)
 
-    def truncate_table(self, model_class, restart_identity=False,
+    async def truncate_table(self, model_class, restart_identity=False,
                        cascade=False):
         qc = self.compiler()
-        return self.execute_sql(*qc.truncate_table(
+        return await self.execute_sql(*qc.truncate_table(
             model_class, restart_identity, cascade))
 
-    def truncate_tables(self, models, restart_identity=False, cascade=False):
+    async def truncate_tables(self, models, restart_identity=False, cascade=False):
         for model in reversed(sort_models_topologically(models)):
-            model.truncate_table(restart_identity, cascade)
+            await model.truncate_table(restart_identity, cascade)
 
-    def drop_sequence(self, seq):
+    async def drop_sequence(self, seq):
         if self.sequences:
             qc = self.compiler()
-            return self.execute_sql(*qc.drop_sequence(seq))
+            return await self.execute_sql(*qc.drop_sequence(seq))
 
     def extract_date(self, date_part, date_field):
         return fn.EXTRACT(Clause(date_part, R('FROM'), date_field))
@@ -3872,143 +3876,6 @@ def __pragma__(name):
         return self.pragma(name, value)
     return property(__get__, __set__)
 
-class SqliteDatabase(Database):
-    compiler_class = SqliteQueryCompiler
-    field_overrides = {
-        'bool': 'INTEGER',
-        'smallint': 'INTEGER',
-        'uuid': 'TEXT',
-    }
-    foreign_keys = False
-    insert_many = sqlite3 and sqlite3.sqlite_version_info >= (3, 7, 11, 0)
-    limit_max = -1
-    op_overrides = {
-        OP.LIKE: 'GLOB',
-        OP.ILIKE: 'LIKE',
-    }
-    upsert_sql = 'INSERT OR REPLACE INTO'
-
-    def __init__(self, database, pragmas=None, *args, **kwargs):
-        self._pragmas = pragmas or []
-        journal_mode = kwargs.pop('journal_mode', None)  # Backwards-compat.
-        if journal_mode:
-            self._pragmas.append(('journal_mode', journal_mode))
-
-        super(SqliteDatabase, self).__init__(database, *args, **kwargs)
-
-    def _connect(self, database, **kwargs):
-        if not sqlite3:
-            raise ImproperlyConfigured('pysqlite or sqlite3 must be installed.')
-        conn = sqlite3.connect(database, **kwargs)
-        conn.isolation_level = None
-        try:
-            self._add_conn_hooks(conn)
-        except:
-            conn.close()
-            raise
-        return conn
-
-    def _add_conn_hooks(self, conn):
-        self._set_pragmas(conn)
-        conn.create_function('date_part', 2, _sqlite_date_part)
-        conn.create_function('date_trunc', 2, _sqlite_date_trunc)
-        conn.create_function('regexp', 2, _sqlite_regexp)
-
-    def _set_pragmas(self, conn):
-        if self._pragmas:
-            cursor = conn.cursor()
-            for pragma, value in self._pragmas:
-                cursor.execute('PRAGMA %s = %s;' % (pragma, value))
-            cursor.close()
-
-    def pragma(self, key, value=SENTINEL):
-        sql = 'PRAGMA %s' % key
-        if value is not SENTINEL:
-            sql += ' = %s' % value
-        return self.execute_sql(sql).fetchone()
-
-    cache_size = __pragma__('cache_size')
-    foreign_keys = __pragma__('foreign_keys')
-    journal_mode = __pragma__('journal_mode')
-    journal_size_limit = __pragma__('journal_size_limit')
-    mmap_size = __pragma__('mmap_size')
-    page_size = __pragma__('page_size')
-    read_uncommitted = __pragma__('read_uncommitted')
-    synchronous = __pragma__('synchronous')
-    wal_autocheckpoint = __pragma__('wal_autocheckpoint')
-
-    def begin(self, lock_type=None):
-        statement = 'BEGIN %s' % lock_type if lock_type else 'BEGIN'
-        self.execute_sql(statement, require_commit=False)
-
-    def transaction(self, transaction_type=None):
-        return transaction_sqlite(self, transaction_type)
-
-    def create_foreign_key(self, model_class, field, constraint=None):
-        raise OperationalError('SQLite does not support ALTER TABLE '
-                               'statements to add constraints.')
-
-    def get_tables(self, schema=None):
-        cursor = self.execute_sql('SELECT name FROM sqlite_master WHERE '
-                                  'type = ? ORDER BY name;', ('table',))
-        return [row[0] for row in cursor.fetchall()]
-
-    def get_indexes(self, table, schema=None):
-        query = ('SELECT name, sql FROM sqlite_master '
-                 'WHERE tbl_name = ? AND type = ? ORDER BY name')
-        cursor = self.execute_sql(query, (table, 'index'))
-        index_to_sql = dict(cursor.fetchall())
-
-        # Determine which indexes have a unique constraint.
-        unique_indexes = set()
-        cursor = self.execute_sql('PRAGMA index_list("%s")' % table)
-        for row in cursor.fetchall():
-            name = row[1]
-            is_unique = int(row[2]) == 1
-            if is_unique:
-                unique_indexes.add(name)
-
-        # Retrieve the indexed columns.
-        index_columns = {}
-        for index_name in sorted(index_to_sql):
-            cursor = self.execute_sql('PRAGMA index_info("%s")' % index_name)
-            index_columns[index_name] = [row[2] for row in cursor.fetchall()]
-
-        return [
-            IndexMetadata(
-                name,
-                index_to_sql[name],
-                index_columns[name],
-                name in unique_indexes,
-                table)
-            for name in sorted(index_to_sql)]
-
-    def get_columns(self, table, schema=None):
-        cursor = self.execute_sql('PRAGMA table_info("%s")' % table)
-        return [ColumnMetadata(row[1], row[2], not row[3], bool(row[5]), table)
-                for row in cursor.fetchall()]
-
-    def get_primary_keys(self, table, schema=None):
-        cursor = self.execute_sql('PRAGMA table_info("%s")' % table)
-        return [row[1] for row in cursor.fetchall() if row[-1]]
-
-    def get_foreign_keys(self, table, schema=None):
-        cursor = self.execute_sql('PRAGMA foreign_key_list("%s")' % table)
-        return [ForeignKeyMetadata(row[3], row[2], row[4], table)
-                for row in cursor.fetchall()]
-
-    def savepoint(self, sid=None):
-        return savepoint_sqlite(self, sid)
-
-    def extract_date(self, date_part, date_field):
-        return fn.date_part(date_part, date_field)
-
-    def truncate_date(self, date_part, date_field):
-        return fn.strftime(SQLITE_DATE_TRUNC_MAPPING[date_part], date_field)
-
-    def get_binary_type(self):
-        return sqlite3.Binary
-
 class PostgresqlDatabase(Database):
     commit_select = True
     compound_select_parentheses = True
@@ -4026,7 +3893,6 @@ class PostgresqlDatabase(Database):
     for_update = True
     for_update_nowait = True
     insert_returning = True
-    interpolation = '%s'
     op_overrides = {
         OP.REGEXP: '~',
     }
@@ -4034,18 +3900,14 @@ class PostgresqlDatabase(Database):
     returning_clause = True
     sequences = True
     window_functions = True
+    interpolation = '${index}'
 
     register_unicode = True
 
-    def _connect(self, database, encoding=None, **kwargs):
-        if not psycopg2:
-            raise ImproperlyConfigured('psycopg2 must be installed.')
-        conn = psycopg2.connect(database=database, **kwargs)
-        if self.register_unicode:
-            pg_extensions.register_type(pg_extensions.UNICODE, conn)
-            pg_extensions.register_type(pg_extensions.UNICODEARRAY, conn)
-        if encoding:
-            conn.set_client_encoding(encoding)
+    async def _connect(self, database, **kwargs):
+        if not asyncpg:
+            raise ImproperlyConfigured('asyncpg must be installed.')
+        conn = await asyncpg.connect(database=database, **kwargs)
         return conn
 
     def _get_pk_sequence(self, model):
@@ -4072,10 +3934,10 @@ class PostgresqlDatabase(Database):
             self.commit()
         return result
 
-    def get_tables(self, schema='public'):
+    async def get_tables(self, schema='public'):
         query = ('SELECT tablename FROM pg_catalog.pg_tables '
                  'WHERE schemaname = %s ORDER BY tablename')
-        return [r for r, in self.execute_sql(query, (schema,)).fetchall()]
+        return [r for r, in await self.execute_sql(query, (schema,)).fetchall()]
 
     def get_indexes(self, table, schema='public'):
         query = """
@@ -4156,105 +4018,22 @@ class PostgresqlDatabase(Database):
     def get_noop_sql(self):
         return 'SELECT 0 WHERE false'
 
-    def get_binary_type(self):
-        return psycopg2.Binary
-
-class MySQLDatabase(Database):
-    commit_select = True
-    compound_select_parentheses = True
-    compound_operations = ['UNION', 'UNION ALL']
-    field_overrides = {
-        'bool': 'BOOL',
-        'decimal': 'NUMERIC',
-        'double': 'DOUBLE PRECISION',
-        'float': 'FLOAT',
-        'primary_key': 'INTEGER AUTO_INCREMENT',
-        'text': 'LONGTEXT',
-        'uuid': 'VARCHAR(40)',
-    }
-    for_update = True
-    interpolation = '%s'
-    limit_max = 2 ** 64 - 1  # MySQL quirk
-    op_overrides = {
-        OP.LIKE: 'LIKE BINARY',
-        OP.ILIKE: 'LIKE',
-        OP.XOR: 'XOR',
-    }
-    quote_char = '`'
-    subquery_delete_same_table = False
-    upsert_sql = 'REPLACE INTO'
-
-    def _connect(self, database, **kwargs):
-        if not mysql:
-            raise ImproperlyConfigured('MySQLdb or PyMySQL must be installed.')
-        conn_kwargs = {
-            'charset': 'utf8',
-            'use_unicode': True,
-        }
-        conn_kwargs.update(kwargs)
-        if 'password' in conn_kwargs:
-            conn_kwargs['passwd'] = conn_kwargs.pop('password')
-        return mysql.connect(db=database, **conn_kwargs)
-
-    def get_tables(self, schema=None):
-        return [row for row, in self.execute_sql('SHOW TABLES')]
-
-    def get_indexes(self, table, schema=None):
-        cursor = self.execute_sql('SHOW INDEX FROM `%s`' % table)
-        unique = set()
-        indexes = {}
-        for row in cursor.fetchall():
-            if not row[1]:
-                unique.add(row[2])
-            indexes.setdefault(row[2], [])
-            indexes[row[2]].append(row[4])
-        return [IndexMetadata(name, None, indexes[name], name in unique, table)
-                for name in indexes]
-
-    def get_columns(self, table, schema=None):
-        sql = """
-            SELECT column_name, is_nullable, data_type
-            FROM information_schema.columns
-            WHERE table_name = %s AND table_schema = DATABASE()"""
-        cursor = self.execute_sql(sql, (table,))
-        pks = set(self.get_primary_keys(table))
-        return [ColumnMetadata(name, dt, null == 'YES', name in pks, table)
-                for name, null, dt in cursor.fetchall()]
-
-    def get_primary_keys(self, table, schema=None):
-        cursor = self.execute_sql('SHOW INDEX FROM `%s`' % table)
-        return [row[4] for row in cursor.fetchall() if row[2] == 'PRIMARY']
-
-    def get_foreign_keys(self, table, schema=None):
-        query = """
-            SELECT column_name, referenced_table_name, referenced_column_name
-            FROM information_schema.key_column_usage
-            WHERE table_name = %s
-                AND table_schema = DATABASE()
-                AND referenced_table_name IS NOT NULL
-                AND referenced_column_name IS NOT NULL"""
-        cursor = self.execute_sql(query, (table,))
-        return [
-            ForeignKeyMetadata(column, dest_table, dest_column, table)
-            for column, dest_table, dest_column in cursor.fetchall()]
-
-    def extract_date(self, date_part, date_field):
-        return fn.EXTRACT(Clause(R(date_part), R('FROM'), date_field))
-
-    def truncate_date(self, date_part, date_field):
-        return fn.DATE_FORMAT(date_field, MYSQL_DATE_TRUNC_MAPPING[date_part])
-
-    def default_insert_clause(self, model_class):
-        return Clause(
-            EnclosedClause(model_class._meta.primary_key),
-            SQL('VALUES (DEFAULT)'))
-
-    def get_noop_sql(self):
-        return 'DO 0'
-
-    def get_binary_type(self):
-        return mysql.Binary
-
+    async def execute_sql(self, sql, params=None, require_commit=True):
+        logger.debug((sql, params))
+        with self.exception_wrapper:
+            conn = await self.get_conn()
+            values = await conn.fetch(sql, *params)
+            # TODO: support atomicity
+            # try:
+            #     values = await conn.fetch(sql)
+            # except Exception:
+            #     if self.autorollback and self.get_autocommit():
+            #         self.rollback()
+            #     raise
+            # else:
+            #     if require_commit and self.get_autocommit():
+            #         self.commit()
+        return values
 
 class _callable_context_manager(object):
     __slots__ = ()
@@ -4519,10 +4298,7 @@ if _SortedFieldList is None:
 
 class DoesNotExist(Exception): pass
 
-if sqlite3:
-    default_database = SqliteDatabase('peewee.db')
-else:
-    default_database = None
+default_database = None
 
 class ModelOptions(object):
     def __init__(self, cls, database=None, db_table=None, db_table_func=None,
@@ -4844,9 +4620,9 @@ class Model(with_metaclass(BaseModel)):
         return RawQuery(cls, sql, *params)
 
     @classmethod
-    def create(cls, **query):
+    async def create(cls, **query):
         inst = cls(**query)
-        inst.save(force_insert=True)
+        await inst.save(force_insert=True)
         inst._prepare_instance()
         return inst
 
@@ -4902,15 +4678,15 @@ class Model(with_metaclass(BaseModel)):
         return cls.select().filter(*dq, **query)
 
     @classmethod
-    def table_exists(cls):
+    async def table_exists(cls):
         kwargs = {}
         if cls._meta.schema:
             kwargs['schema'] = cls._meta.schema
-        return cls._meta.db_table in cls._meta.database.get_tables(**kwargs)
+        return cls._meta.db_table in await cls._meta.database.get_tables(**kwargs)
 
     @classmethod
-    def create_table(cls, fail_silently=False):
-        if fail_silently and cls.table_exists():
+    async def create_table(cls, fail_silently=False):
+        if fail_silently and await cls.table_exists():
             return
 
         db = cls._meta.database
@@ -4919,8 +4695,8 @@ class Model(with_metaclass(BaseModel)):
             if not db.sequence_exists(pk.sequence):
                 db.create_sequence(pk.sequence)
 
-        db.create_table(cls)
-        cls._create_indexes()
+        await db.create_table(cls)
+        await cls._create_indexes()
 
     @classmethod
     def _fields_to_index(cls):
@@ -4943,14 +4719,14 @@ class Model(with_metaclass(BaseModel)):
             cls._meta.indexes or ())
 
     @classmethod
-    def _create_indexes(cls):
+    async def _create_indexes(cls):
         for field_list, is_unique in cls._index_data():
-            cls._meta.database.create_index(cls, field_list, is_unique)
+            await cls._meta.database.create_index(cls, field_list, is_unique)
 
     @classmethod
-    def _drop_indexes(cls, safe=False):
+    async def _drop_indexes(cls, safe=False):
         for field_list, is_unique in cls._index_data():
-            cls._meta.database.drop_index(cls, field_list, safe)
+            await cls._meta.database.drop_index(cls, field_list, safe)
 
     @classmethod
     def sqlall(cls):
@@ -5023,7 +4799,7 @@ class Model(with_metaclass(BaseModel)):
                 setattr(self, key, getattr(self, key))
                 field_dict[key] = self._data[key]
 
-    def save(self, force_insert=False, only=None):
+    async def save(self, force_insert=False, only=None):
         field_dict = dict(self._data)
         if self._meta.primary_key is not False:
             pk_field = self._meta.primary_key
@@ -5047,12 +4823,12 @@ class Model(with_metaclass(BaseModel)):
                     field_dict.pop(pk_part_name, None)
             else:
                 field_dict.pop(pk_field.name, None)
-            rows = self.update(**field_dict).where(self._pk_expr()).execute()
+            rows = await self.update(**field_dict).where(self._pk_expr()).execute()
         elif pk_field is None:
             self.insert(**field_dict).execute()
             rows = 1
         else:
-            pk_from_cursor = self.insert(**field_dict).execute()
+            pk_from_cursor = await self.insert(**field_dict).execute()
             if pk_from_cursor is not None:
                 pk_value = pk_from_cursor
             self._set_pk_value(pk_value)
@@ -5235,12 +5011,12 @@ def prefetch(sq, *subqueries):
 
     return prefetch_result.query
 
-def create_model_tables(models, **create_table_kwargs):
+async def create_model_tables(models, **create_table_kwargs):
     """Create tables for all given models (in the right order)."""
     for m in sort_models_topologically(models):
-        m.create_table(**create_table_kwargs)
+        await m.create_table(**create_table_kwargs)
 
-def drop_model_tables(models, **drop_table_kwargs):
+async def drop_model_tables(models, **drop_table_kwargs):
     """Drop tables for all given models (in the right order)."""
     for m in reversed(sort_models_topologically(models)):
-        m.drop_table(**drop_table_kwargs)
+        await m.drop_table(**drop_table_kwargs)
